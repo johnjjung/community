@@ -51,6 +51,7 @@ A solution to troubleshoot arbitrary container images MUST:
 *   have an excellent user experience (i.e. should be a feature of the platform
     rather than config-time trickery)
 *   have no *inherent* side effects to the running container image
+*   API must use v1.Container [sig-auth]
 
 ## Feature Summary
 
@@ -106,13 +107,63 @@ subsequently be used to reattach and is reported by `kubectl describe`.
 
 ### Kubernetes API Changes
 
-#### Chosen Solution: "exec++"
+#### Chosen Solution: POST to an Existing Pod
 
-We will extend `v1.Pod`'s `/exec` subresource to support "executing" container
-images. The current `/exec` endpoint must implement `GET` to support streaming
-for all clients. We don't want to encode a (potentially large) `v1.Container` as
-an HTTP parameter, so we must extend `v1.PodExecOptions` with the specific
-fields required for creating a Debug Container:
+We're modifying an existing pod, so this fits as a subresource of the target
+pod. Since we're required to use `v1.Container`, the API should use `POST` or
+`PUT` to avoid encoding this relatively large object into a URL query string. If
+we `POST` or `PUT` then we cannot make this a streaming call if we want to
+continue supporting web socket clients.
+
+We can either using an existing subresource like `/exec` and have the call
+stream or not based on `PodExecOptions`, or we can create a new subresource that
+never streams. For the sake of consistency, we will create a new subresource
+named `/debug`. This has the added benefit of being able to entirely hide
+interface behind a feature flag by conditionally registering the new
+subresource.
+
+As `v1.Container` lacks type and object metadata, we must wrap it in a new
+object:
+
+```
+// EphemeralContainer describes a container to attach to a running pod for troubleshooting.
+type EphemeralContainer struct {
+        metav1.TypeMeta
+        metav1.ObjectMeta
+
+        // Spec describes the Ephemeral Container to be created.
+        Spec Container `json:"spec" ...`
+}
+```
+
+Note that Debug Containers are not regular containers and should not be used to
+build services. They have no guarantees and most of the fields of `v1.Container`
+will not be allowed for Debug Containers. A request will be rejected if any
+field is set other than the following whitelisted fields: `Name`, `Image`,
+`Command`, `Args`, `WorkingDir`, `Env`, `EnvFrom`, `ImagePullPolicy`,
+`SecurityContext`. `TTY` and `Stdin` are always enabled for Debug Containers and
+will be ignored.
+
+The new `/debug` subresource allows the following:
+
+1.  A `POST` of a `PodDebugContainer` to
+    `/api/v1/namespaces/$NS/pods/$POD_NAME/debug` to create a Debug Container
+    running in pod `$POD_NAME`.
+1.  A `DELETE` of `/api/v1/namespaces/$NS/pods/$POD_NAME/debug/$NAME` will stop
+    the Debug Container `$NAME` in pod `$POD_NAME`.
+
+Once created, a client would attach to the console of a debug container using
+the existing attach endpoint, `/api/v1/namespaces/$NS/pods/$POD_NAME/attach`.
+Note that any output of the new container between its creation and subsequent
+attach will not be replayed and can only be viewed using `kubectl log`.
+
+#### Alternative 1: "exec++"
+
+A simpler change is to extend `v1.Pod`'s `/exec` subresource to support
+"executing" container images. The current `/exec` endpoint must implement `GET`
+to support streaming for all clients. We don't want to encode a (potentially
+large) `v1.Container` into a query string, so we must extend `v1.PodExecOptions`
+with the specific fields required for creating a Debug Container:
 
 ```
 // PodExecOptions is the query options to a Pod's remote exec call
@@ -140,43 +191,6 @@ terminate. While not ideal, this parallels existing behavior of `kubectl exec`.
 To kill a Debug Container one would `attach` and exit the process interactively
 or create a new Debug Container to send a signal with `kill(1)` to the original
 process.
-
-#### Alternative 1: Debug Subresource
-
-Rather than extending an existing subresource, we could create a new,
-non-streaming `debug` subresource. We would create a new API Object:
-
-```
-// DebugContainer describes a container to attach to a running pod for troubleshooting.
-type DebugContainer struct {
-        metav1.TypeMeta
-        metav1.ObjectMeta
-
-       // Name is the name of the Debug Container. Its presence will cause
-        // exec to create a Debug Container rather than performing a runtime exec.
-        Name string `json:"name,omitempty" ...`
-
-        // Image is an optional container image name that will be used to for the Debug
-        // Container in the specified Pod with Command as ENTRYPOINT. If omitted a
-        // default image will be used.
-        Image string `json:"image,omitempty" ...`
-}
-```
-
-The pod would gain a new `/debug` subresource that allows the following:
-
-1.  A `POST` of a `PodDebugContainer` to
-    `/api/v1/namespaces/$NS/pods/$POD_NAME/debug/$NAME` to create Debug
-    Container named `$NAME` running in pod `$POD_NAME`.
-1.  A `DELETE` of `/api/v1/namespaces/$NS/pods/$POD_NAME/debug/$NAME` will stop
-    the Debug Container `$NAME` in pod `$POD_NAME`.
-
-Once created, a client would attach to the console of a debug container using
-the existing attach endpoint, `/api/v1/namespaces/$NS/pods/$POD_NAME/attach`.
-
-However, this pattern does not resemble any other current usage of the API, so
-we prefer to start with exec++ and reevaluate if we discover a compelling
-reason.
 
 #### Alternative 2: Declarative Configuration
 
